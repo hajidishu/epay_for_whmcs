@@ -1,6 +1,6 @@
-# WHMCS EPay Secure
+# EPay for WHMCS
 
-WHMCS EPay Secure 是一款适用于 WHMCS 的 EPay兼容支付网关插件。
+EPay for WHMCS 是一款适用于 WHMCS 的 EPay兼容支付网关插件。
 
 本插件用于在 WHMCS 中接入兼容 EPay API 的支付服务商，支持多种订单方式，并解决了部分epay兼容系统订单过期问题
 
