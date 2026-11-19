@@ -23,13 +23,16 @@ function epay_admin_show_orders($invoiceId)
                 'processing_amount', 'processing_currency', 'status', 'expires_at', 'last_error')),
         'legacy_payments' => Capsule::table('mod_epay_legacy_events')->where('invoice_id', $invoiceId)->orderBy('id')
             ->get(array('out_trade_no', 'provider_trade_no', 'processing_amount', 'processing_currency', 'status', 'note')),
+        'payment_reviews' => Capsule::table('mod_epay_payment_reviews')->where('invoice_id', $invoiceId)->orderBy('id')
+            ->get(array('out_trade_no', 'provider_trade_no', 'processing_amount', 'status', 'note')),
     );
 }
 
 function epay_admin_confirm_closed($invoiceId, $order, $reference)
 {
     if ($order === 'legacy') {
-        if (!epay_secure_legacy_invoice($invoiceId) || epay_secure_get_meta(epay_secure_legacy_paid_key($invoiceId), '') !== ''
+        $notice = epay_secure_get_meta(epay_secure_legacy_paid_key($invoiceId), '');
+        if (!epay_secure_legacy_invoice($invoiceId) || ($notice !== '' && $notice !== 'provider')
             || Capsule::table('mod_epay_legacy_events')->where('invoice_id', $invoiceId)
             ->where('status', 'paid_review')->exists()) {
             throw new RuntimeException('无可关闭的迁移旧单，或仍有一笔旧付款待核账。');
@@ -60,6 +63,33 @@ function epay_admin_resolve_review($invoiceId, $trade, $outcome, $reference, $or
     $now = date('Y-m-d H:i:s');
 
     Capsule::connection()->transaction(function () use ($invoiceId, $trade, $order, $note, $now, $outcome) {
+        $reviews = Capsule::table('mod_epay_payment_reviews')->where('invoice_id', $invoiceId)
+            ->where('provider_trade_no', $trade)->where('status', 'paid_review');
+        if ($order !== '') {
+            $reviews->where('out_trade_no', $order === 'legacy' ? (string) $invoiceId : $order);
+        }
+        $events = $reviews->limit(2)->get();
+        if (count($events) > 1) {
+            throw new RuntimeException('该交易号有多条待核账记录，请指定原商户订单号。');
+        }
+        $event = $events->first();
+        if ($event) {
+            Capsule::table('mod_epay_payment_reviews')->where('id', $event->id)->update(array(
+                'status' => 'reconciled', 'note' => $note, 'updated_at' => $now,
+            ));
+            $attempt = Capsule::table('mod_epay_attempts')->where('invoice_id', $invoiceId)
+                ->where('out_trade_no', $event->out_trade_no)->first();
+            if ($attempt && (string) $attempt->gateway_fingerprint === (string) $event->gateway_fingerprint
+                && (empty($attempt->provider_trade_no) || (string) $attempt->provider_trade_no === $trade)
+                && in_array($attempt->status, array('pending', 'expired', 'blocked_review', 'awaiting_callback', 'paid_review'), true)) {
+                Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->update(array(
+                    'status' => 'reconciled', 'provider_trade_no' => $trade, 'last_error' => $note, 'last_seen_at' => $now,
+                ));
+            } elseif ((string) $event->out_trade_no === (string) $invoiceId && epay_secure_legacy_invoice($invoiceId)) {
+                epay_secure_set_legacy_clear($invoiceId, $note);
+            }
+            return;
+        }
         $attempt = Capsule::table('mod_epay_attempts')->where('invoice_id', $invoiceId)
             ->where(function ($query) use ($trade, $order) {
                 $query->where('provider_trade_no', $trade);

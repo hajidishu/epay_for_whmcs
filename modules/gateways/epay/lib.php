@@ -2,6 +2,8 @@
 
 use WHMCS\Database\Capsule;
 
+class EpaySecurePaymentReview extends RuntimeException {}
+
 if (!function_exists('epay_secure_html')) {
     function epay_secure_html($value)
     {
@@ -110,7 +112,8 @@ if (!function_exists('epay_secure_launch_token')) {
         $timestamp,
         $returnUrl,
         $description,
-        $key
+        $key,
+        $gatewayFingerprint
     ) {
         $payload = implode("\n", array(
             (string) (int) $invoiceId,
@@ -121,6 +124,7 @@ if (!function_exists('epay_secure_launch_token')) {
             (string) (int) $timestamp,
             (string) $returnUrl,
             (string) $description,
+            (string) $gatewayFingerprint,
         ));
 
         return hash_hmac('sha256', $payload, (string) $key);
@@ -139,7 +143,8 @@ if (!function_exists('epay_secure_verify_launch_token')) {
         $description,
         $key,
         $ttlSeconds,
-        $receivedToken
+        $receivedToken,
+        $gatewayFingerprint
     ) {
         $timestamp = (int) $timestamp;
         $now = time();
@@ -156,12 +161,24 @@ if (!function_exists('epay_secure_verify_launch_token')) {
             $timestamp,
             $returnUrl,
             $description,
-            $key
+            $key,
+            $gatewayFingerprint
         );
 
         $receivedToken = (string) $receivedToken;
         return $receivedToken !== '' && hash_equals($expected, $receivedToken);
     }
+}
+
+function epay_secure_gateway_fingerprint(array $gateway)
+{
+    $base = epay_secure_gateway_base_url($gateway['gatewayUrl'], !empty($gateway['allowHttp']));
+    $pid = trim((string) ($gateway['pid'] ?? ''));
+    $key = (string) ($gateway['key'] ?? '');
+    if ($pid === '' || $key === '') {
+        throw new RuntimeException('请先配置支付商的商户 ID 和密钥。');
+    }
+    return hash_hmac('sha256', $base . "\n" . $pid, $key);
 }
 
 if (!function_exists('epay_secure_gateway_base_url')) {
@@ -276,6 +293,27 @@ if (!function_exists('epay_secure_ensure_schema')) {
             return;
         }
         $schema = Capsule::schema();
+        if (!epay_secure_schema_ready($schema)) {
+            $lock = epay_secure_acquire_lock('schema', 25);
+            try {
+                if (!epay_secure_schema_ready($schema)) {
+                    epay_secure_migrate_schema($schema);
+                }
+            } finally {
+                epay_secure_release_lock($lock);
+            }
+        }
+        $ready = true;
+    }
+
+    function epay_secure_schema_ready($schema)
+    {
+        return $schema->hasTable('mod_epay_meta') && epay_secure_get_meta('schema_version', '') === '2.4'
+            && epay_secure_get_meta('legacy_cutover_at', '') !== '';
+    }
+
+    function epay_secure_migrate_schema($schema)
+    {
         $attemptsExisted = $schema->hasTable('mod_epay_attempts');
 
         if (!$attemptsExisted) {
@@ -284,6 +322,7 @@ if (!function_exists('epay_secure_ensure_schema')) {
                 $table->unsignedInteger('invoice_id');
                 $table->string('out_trade_no', 64)->unique();
                 $table->string('provider_trade_no', 128)->nullable()->index();
+                $table->string('gateway_fingerprint', 64)->nullable();
                 $table->decimal('invoice_amount', 18, 2)->nullable();
                 $table->string('invoice_currency', 16)->nullable();
                 $table->decimal('processing_amount', 18, 2)->nullable();
@@ -291,7 +330,7 @@ if (!function_exists('epay_secure_ensure_schema')) {
                 $table->decimal('conversion_rate', 28, 12)->nullable();
                 $table->decimal('invoice_fee', 18, 2)->nullable();
                 $table->string('payment_type', 32);
-                $table->string('source', 16)->default('v22');
+                $table->string('source', 16)->default('v24');
                 $table->string('status', 32)->default('pending');
                 $table->unsignedInteger('launch_count')->default(1);
                 $table->string('client_ip', 45)->nullable();
@@ -308,6 +347,9 @@ if (!function_exists('epay_secure_ensure_schema')) {
                 $table->index('expires_at', 'epay_expires_idx');
             });
         } else {
+            epay_secure_schema_add_column('mod_epay_attempts', 'gateway_fingerprint', function ($table) {
+                $table->string('gateway_fingerprint', 64)->nullable();
+            });
             // v2.0/v2.1 -> v2.2 in-place schema migration. Old amount/currency columns are kept for rollback safety.
             epay_secure_schema_add_column('mod_epay_attempts', 'invoice_amount', function ($table) {
                 $table->decimal('invoice_amount', 18, 2)->nullable();
@@ -372,9 +414,26 @@ if (!function_exists('epay_secure_ensure_schema')) {
             });
         }
 
-        epay_secure_set_meta_if_missing('schema_version', '2.2');
+        if (!$schema->hasTable('mod_epay_payment_reviews')) {
+            $schema->create('mod_epay_payment_reviews', function ($table) {
+                $table->bigIncrements('id');
+                $table->string('event_key', 64)->unique();
+                $table->unsignedInteger('invoice_id');
+                $table->string('out_trade_no', 64);
+                $table->string('provider_trade_no', 128);
+                $table->string('gateway_fingerprint', 64);
+                $table->decimal('processing_amount', 18, 2);
+                $table->string('status', 32)->default('paid_review');
+                $table->string('note', 255);
+                $table->text('callback_payload')->nullable();
+                $table->dateTime('created_at');
+                $table->dateTime('updated_at');
+                $table->index(array('invoice_id', 'status'), 'epay_payment_reviews_invoice_status_idx');
+            });
+        }
+        epay_secure_set_meta_if_missing('schema_version', '2.4');
         Capsule::table('mod_epay_meta')->where('meta_key', 'schema_version')->update(array(
-            'meta_value' => '2.2',
+            'meta_value' => '2.4',
             'updated_at' => date('Y-m-d H:i:s'),
         ));
 
@@ -383,7 +442,6 @@ if (!function_exists('epay_secure_ensure_schema')) {
             $cutoverAt = date('Y-m-d H:i:s');
             epay_secure_set_meta_if_missing('legacy_cutover_at', $cutoverAt);
         }
-        $ready = true;
     }
 }
 
@@ -477,7 +535,8 @@ if (!function_exists('epay_secure_invoice_has_unresolved_review')) {
         return Capsule::table('mod_epay_legacy_events')
             ->where('invoice_id', $invoiceId)
             ->where('status', 'paid_review')
-            ->exists();
+            ->exists() || Capsule::table('mod_epay_payment_reviews')->where('invoice_id', $invoiceId)
+                ->where('status', 'paid_review')->exists();
     }
 }
 
@@ -547,7 +606,8 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
         $paymentType,
         $lifetimeHours,
         $clientIp,
-        $feeRate
+        $feeRate,
+        $gatewayFingerprint
     ) {
         epay_secure_ensure_schema();
 
@@ -573,6 +633,7 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
             $clientIp,
             $invoiceFee,
             $conversionRate,
+            $gatewayFingerprint,
             $now
         ) {
             $lockedInvoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->lockForUpdate()->first();
@@ -589,6 +650,9 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
             $active = $open->first();
 
             if ($active) {
+                if (!hash_equals((string) ($active->gateway_fingerprint ?? ''), $gatewayFingerprint)) {
+                    throw new RuntimeException('旧支付订单的商户配置尚未核对，请联系管理员。');
+                }
                 if ($active->status === 'awaiting_callback') {
                     throw new RuntimeException('支付平台显示已付款，请等待支付通知或联系管理员核账。');
                 }
@@ -635,12 +699,12 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
                 $sameInvoiceAmount = $activeInvoiceAmount !== null
                     && epay_secure_money_to_cents($activeInvoiceAmount) === epay_secure_money_to_cents($invoiceAmount);
                 $sameInvoiceCurrency = $activeInvoiceCurrency === $invoiceCurrency;
-                $sameProcessingAmount = $activeProcessingAmount !== null
-                    && epay_secure_money_to_cents($activeProcessingAmount) === epay_secure_money_to_cents($processingAmount);
+                $validProcessingAmount = $activeProcessingAmount !== null
+                    && epay_secure_money_to_cents($activeProcessingAmount) > 0;
                 $sameProcessingCurrency = $activeProcessingCurrency === $processingCurrency;
                 $sameType = (string) $active->payment_type === $paymentType;
 
-                if (!$sameInvoiceAmount || !$sameInvoiceCurrency || !$sameProcessingAmount || !$sameProcessingCurrency || !$sameType) {
+                if (!$sameInvoiceAmount || !$sameInvoiceCurrency || !$validProcessingAmount || !$sameProcessingCurrency || !$sameType) {
                     throw new RuntimeException(
                         'This invoice already has an active EPay order with different payment details. '
                         . 'Do not create a second provider order while the first can still be paid. '
@@ -667,6 +731,7 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
                 'invoice_id' => $invoiceId,
                 'out_trade_no' => $outTradeNo,
                 'provider_trade_no' => null,
+                'gateway_fingerprint' => $gatewayFingerprint,
                 'invoice_amount' => $invoiceAmount,
                 'invoice_currency' => $invoiceCurrency,
                 'processing_amount' => $processingAmount,
@@ -674,7 +739,7 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
                 'conversion_rate' => $conversionRate,
                 'invoice_fee' => $invoiceFee,
                 'payment_type' => $paymentType,
-                'source' => 'v23',
+                'source' => 'v24',
                 'status' => 'pending',
                 'launch_count' => 1,
                 'client_ip' => $clientIp,
@@ -824,16 +889,20 @@ if (!function_exists('epay_secure_query_order_v1')) {
 }
 
 if (!function_exists('epay_secure_verify_provider_order')) {
-    function epay_secure_verify_provider_order(array $gatewayParams, $outTradeNo, $transactionId, $paymentType, $processingAmount)
+    function epay_secure_verify_provider_order(array $gatewayParams, $outTradeNo, $transactionId, $paymentType, $processingAmount, $required = false)
     {
-        if (empty($gatewayParams['verifyOrderQuery'])) {
+        if (!$required && empty($gatewayParams['verifyOrderQuery'])) {
             return;
         }
 
         if (epay_secure_is_mhpay($gatewayParams)) {
             $evidence = epay_secure_query_mhpay_order($gatewayParams, $outTradeNo);
             $reportedTrade = $evidence['order']['trade_no'] ?? null;
-            if ($evidence['state'] !== 'paid_notice' || ($reportedTrade !== null && $reportedTrade !== (string) $transactionId)) {
+            if (in_array($evidence['state'], array('refunded', 'payment_review', 'closed', 'mismatch'), true)
+                || ($reportedTrade !== null && $reportedTrade !== (string) $transactionId)) {
+                throw new EpaySecurePaymentReview('MHPay 查单显示退款、关闭或交易信息不一致，请人工核账。');
+            }
+            if ($evidence['state'] !== 'paid_notice') {
                 throw new RuntimeException('MHPay 查单尚未确认付款，请重试回调。');
             }
             return;
@@ -847,19 +916,19 @@ if (!function_exists('epay_secure_verify_provider_order')) {
             throw new RuntimeException('Provider order query does not show a paid order.');
         }
         if (!isset($order['out_trade_no']) || !hash_equals((string) $outTradeNo, (string) $order['out_trade_no'])) {
-            throw new RuntimeException('Provider order query out_trade_no mismatch.');
+            throw new EpaySecurePaymentReview('Provider order query out_trade_no mismatch.');
         }
         if (!isset($order['trade_no']) || !hash_equals((string) $transactionId, (string) $order['trade_no'])) {
-            throw new RuntimeException('Provider order query trade_no mismatch.');
+            throw new EpaySecurePaymentReview('Provider order query trade_no mismatch.');
         }
         if (!isset($order['money']) || epay_secure_money_to_cents($order['money']) !== epay_secure_money_to_cents($processingAmount)) {
-            throw new RuntimeException('Provider order query amount mismatch.');
+            throw new EpaySecurePaymentReview('Provider order query amount mismatch.');
         }
         if (isset($order['type']) && $order['type'] !== '' && (string) $order['type'] !== (string) $paymentType) {
-            throw new RuntimeException('Provider order query payment type mismatch.');
+            throw new EpaySecurePaymentReview('Provider order query payment type mismatch.');
         }
         if (isset($order['pid']) && $order['pid'] !== '' && (string) $order['pid'] !== (string) $gatewayParams['pid']) {
-            throw new RuntimeException('Provider order query PID mismatch.');
+            throw new EpaySecurePaymentReview('Provider order query PID mismatch.');
         }
     }
 }
@@ -867,19 +936,6 @@ if (!function_exists('epay_secure_verify_provider_order')) {
 function epay_secure_is_mhpay(array $gateway)
 {
     return strcasecmp((string) parse_url((string) ($gateway['gatewayUrl'] ?? ''), PHP_URL_HOST), 'pay.hhdgdh.top') === 0;
-}
-
-function epay_secure_mhpay_status(array $response)
-{
-    return (string) ($response['code'] ?? '') === '1' && ($response['data']['status'] ?? null) === 'success';
-}
-
-function epay_secure_mhpay_order_paid(array $gateway, $outTradeNo)
-{
-    $base = epay_secure_gateway_base_url($gateway['gatewayUrl'], false);
-    $body = epay_secure_post_form($base . '/api/EasyPay/queryOrder', array('orderNo' => (string) $outTradeNo), true);
-    $response = json_decode($body, true);
-    return is_array($response) && epay_secure_mhpay_status($response);
 }
 
 function epay_secure_mhpay_order_evidence(array $response, $outTradeNo)
@@ -892,14 +948,25 @@ function epay_secure_mhpay_order_evidence(array $response, $outTradeNo)
         return array('state' => 'mismatch', 'order' => array());
     }
     $order = array('out_trade_no' => (string) $outTradeNo, 'trade_no' => (string) $data['order_no']);
-    $status = strtolower((string) ($data['order_status'] ?? ''));
-    if ($status === 'paid' || (int) ($data['payment_time'] ?? 0) > 0 || (float) ($data['refund_amount'] ?? 0) > 0) {
+    $status = strtolower(trim((string) ($data['order_status'] ?? '')));
+    $refund = $data['refund_amount'] ?? null;
+    if ((is_numeric($refund) && (float) $refund > 0) || (int) ($data['refund_time'] ?? 0) > 0
+        || in_array($status, array('refund', 'refunded', 'partially_refunded'), true)) {
+        return array('state' => 'refunded', 'order' => $order);
+    }
+    if ($status === 'paid' && is_numeric($refund) && (float) $refund === 0.0) {
         return array('state' => 'paid_notice', 'order' => $order);
+    }
+    if ($status === 'paid' || (int) ($data['payment_time'] ?? 0) > 0) {
+        return array('state' => 'payment_review', 'order' => $order);
     }
     // MHPay documents a successful V2 lookup with bound order IDs. Only an
     // explicit terminal status on that lookup can close a local Attempt.
     if (in_array($status, array('closed', 'expired', 'cancelled', 'canceled'), true)) {
         return array('state' => 'closed', 'order' => $order);
+    }
+    if (in_array($status, array('pending', 'unpaid'), true)) {
+        return array('state' => 'unpaid', 'order' => $order);
     }
     return array('state' => 'unknown', 'order' => $order);
 }
@@ -912,14 +979,10 @@ function epay_secure_query_mhpay_order(array $gateway, $outTradeNo)
     try {
         $body = epay_secure_post_form($base . '/api/v2/queryorder', $params, true);
         $response = json_decode($body, true);
-        $evidence = epay_secure_mhpay_order_evidence(is_array($response) ? $response : array(), $outTradeNo);
+        return epay_secure_mhpay_order_evidence(is_array($response) ? $response : array(), $outTradeNo);
     } catch (RuntimeException $e) {
-        $evidence = array('state' => 'unknown', 'order' => array());
+        return array('state' => 'unknown', 'order' => array());
     }
-    if ($evidence['state'] !== 'unknown' || $evidence['order']) {
-        return $evidence;
-    }
-    return array('state' => epay_secure_mhpay_order_paid($gateway, $outTradeNo) ? 'paid_notice' : 'unknown', 'order' => array());
 }
 
 function epay_secure_cashier_url(array $response, array $gateway)

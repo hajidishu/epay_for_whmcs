@@ -121,12 +121,12 @@ function epay_secure_assert_attempt_identity($attempt, array $data)
     }
     if ((string) $attempt->out_trade_no !== (string) ($data['out_trade_no'] ?? '')
         || (!empty($attempt->provider_trade_no) && !hash_equals((string) $attempt->provider_trade_no, $tradeNo))) {
-        throw new RuntimeException('支付平台的订单号与本地记录不一致，请人工核账。');
+        throw new EpaySecurePaymentReview('支付平台的订单号与本地记录不一致。');
     }
     if ((string) $attempt->payment_type !== (string) ($data['type'] ?? '')
         || epay_secure_money_to_cents(epay_secure_attempt_processing_amount($attempt)) !== epay_secure_money_to_cents($data['money'] ?? '')
         || epay_secure_money_to_cents($data['money']) <= 0) {
-        throw new RuntimeException('支付平台的支付方式或金额与本地记录不一致，请人工核账。');
+        throw new EpaySecurePaymentReview('支付平台的支付方式或金额与本地记录不一致。');
     }
 }
 
@@ -157,9 +157,82 @@ function epay_secure_recorded_transaction($invoiceId, $transactionId, $amount = 
     if ((int) $existing->invoiceid !== (int) $invoiceId || (string) $existing->gateway !== 'epay'
         || (float) $existing->amountin <= 0
         || ($amount !== null && epay_secure_money_to_cents($existing->amountin) !== epay_secure_money_to_cents($amount))) {
-        throw new RuntimeException('同一交易号的入账记录与本次付款不匹配，请人工核账。');
+        throw new EpaySecurePaymentReview('同一交易号的入账记录与本次付款不匹配。');
     }
     return true;
+}
+
+function epay_secure_review_event_key($attempt, array $data, $fingerprint)
+{
+    return hash('sha256', implode("\n", array($attempt->invoice_id, $attempt->out_trade_no, $data['trade_no'], $fingerprint)));
+}
+
+function epay_secure_record_payment_review($attempt, array $data, $fingerprint, $note)
+{
+    $key = epay_secure_review_event_key($attempt, $data, $fingerprint);
+    $events = Capsule::table('mod_epay_payment_reviews');
+    $prior = $events->where('event_key', $key)->first();
+    if ($prior) {
+        return $prior->status === 'reconciled' ? '已核账交易的重复通知' : '已收款待人工核账';
+    }
+    $now = date('Y-m-d H:i:s');
+    $events->insert(array(
+        'event_key' => $key, 'invoice_id' => (int) $attempt->invoice_id, 'out_trade_no' => $attempt->out_trade_no,
+        'provider_trade_no' => (string) $data['trade_no'], 'gateway_fingerprint' => $fingerprint,
+        'processing_amount' => epay_secure_normalize_money($data['money']), 'status' => 'paid_review',
+        'note' => epay_secure_truncate($note, 255), 'callback_payload' => epay_secure_json_payload($data),
+        'created_at' => $now, 'updated_at' => $now,
+    ));
+    return '已收款待人工核账：' . $note;
+}
+
+// Only called for signed receipts or an authenticated provider query. The caller holds the invoice lock.
+function epay_secure_accept_attempt_receipt($attempt, array $data, array $gateway, $verify)
+{
+    $tradeNo = (string) ($data['trade_no'] ?? '');
+    if ($tradeNo === '' || strlen($tradeNo) > 128 || epay_secure_money_to_cents($data['money'] ?? '') <= 0) {
+        throw new RuntimeException('收款记录缺少有效交易号或金额。');
+    }
+    $fingerprint = epay_secure_gateway_fingerprint($gateway);
+    $prior = Capsule::table('mod_epay_payment_reviews')->where('event_key', epay_secure_review_event_key($attempt, $data, $fingerprint))->first();
+    if ($prior) {
+        return $prior->status === 'reconciled' ? '已核账交易的重复通知' : '已收款待人工核账';
+    }
+    try {
+        if (!empty($attempt->gateway_fingerprint) && !hash_equals($attempt->gateway_fingerprint, $fingerprint)) {
+            throw new EpaySecurePaymentReview('回调商户与原支付订单的商户不同。');
+        }
+        epay_secure_assert_attempt_identity($attempt, $data);
+        $known = epay_secure_recorded_transaction((int) $attempt->invoice_id, $tradeNo)
+            || ((string) $attempt->provider_trade_no === $tradeNo && in_array($attempt->status, array('paid_review', 'reconciled'), true));
+        if ($verify && !$known) {
+            try {
+                epay_secure_verify_provider_order($gateway, $data['out_trade_no'], $tradeNo, $data['type'], $data['money'], epay_secure_is_mhpay($gateway));
+            } catch (EpaySecurePaymentReview $e) {
+                throw $e;
+            } catch (RuntimeException $e) {
+                Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->update(array(
+                    'status' => $attempt->status === 'blocked_review' ? 'blocked_review' : 'awaiting_callback',
+                    'gateway_fingerprint' => $fingerprint, 'provider_trade_no' => $tradeNo,
+                    'callback_payload' => epay_secure_json_payload($data),
+                    'last_error' => '已收到签名通知，等待平台查单确认。', 'last_seen_at' => date('Y-m-d H:i:s'),
+                ));
+                throw $e;
+            }
+        }
+        if (empty($attempt->gateway_fingerprint)) {
+            epay_secure_bind_gateway($attempt, $fingerprint);
+        }
+        return epay_secure_record_attempt_payment($attempt, $data);
+    } catch (EpaySecurePaymentReview $e) {
+        return epay_secure_record_payment_review($attempt, $data, $fingerprint, $e->getMessage());
+    }
+}
+
+function epay_secure_bind_gateway($attempt, $fingerprint)
+{
+    Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->update(array('gateway_fingerprint' => $fingerprint));
+    $attempt->gateway_fingerprint = $fingerprint;
 }
 
 // The caller holds the invoice lock. The transaction lock also protects a
@@ -273,7 +346,8 @@ function epay_secure_assert_legacy_clear($invoiceId, array $gateway)
         || epay_secure_get_meta(epay_secure_legacy_clear_key($invoiceId), '') !== '') {
         return;
     }
-    if (epay_secure_get_meta(epay_secure_legacy_paid_key($invoiceId), '') !== '') {
+    $legacyNotice = epay_secure_get_meta(epay_secure_legacy_paid_key($invoiceId), '');
+    if ($legacyNotice !== '' && $legacyNotice !== 'provider') {
         throw new RuntimeException('支付平台显示旧订单已付款，请等待支付通知或联系管理员核账。');
     }
     $evidence = epay_secure_probe_provider_order($gateway, (string) $invoiceId);
@@ -286,26 +360,51 @@ function epay_secure_assert_legacy_clear($invoiceId, array $gateway)
         logTransaction($gateway['name'], array('invoice_id' => $invoiceId), $note);
         throw new RuntimeException('旧订单已付款，请刷新发票或联系管理员核账。');
     }
-    if ($evidence['state'] === 'paid_notice') {
+    if (in_array($evidence['state'], array('paid_notice', 'refunded', 'payment_review'), true)) {
         epay_secure_set_meta_if_missing(epay_secure_legacy_paid_key($invoiceId), $evidence['order']['trade_no'] ?? 'provider');
-        throw new RuntimeException('支付平台显示旧订单已付款，请等待支付通知或联系管理员核账。');
+        throw new RuntimeException('支付平台显示旧订单曾付款或已退款，请联系管理员核账。');
     }
     throw new RuntimeException('旧版支付订单尚未确认关闭，请联系管理员核对。');
 }
 
-function epay_secure_recover_open_orders($invoiceId, array $gateway)
+function epay_secure_recover_open_orders($invoiceId, array $gateway, $fingerprint)
 {
     foreach (epay_secure_open_attempts($invoiceId)->orderBy('id')->get() as $attempt) {
+        if (!empty($attempt->gateway_fingerprint) && !hash_equals($attempt->gateway_fingerprint, $fingerprint)) {
+            throw new RuntimeException('当前商户配置与旧支付订单不同，请先核对原商户的订单。');
+        }
         $evidence = epay_secure_probe_provider_order($gateway, $attempt->out_trade_no);
         $order = $evidence['order'];
         if ($evidence['state'] === 'mismatch') {
             throw new RuntimeException('支付平台返回的旧订单身份不匹配，请联系管理员核对。');
         }
+        if (empty($attempt->gateway_fingerprint)) {
+            $reportedTrade = (string) ($order['trade_no'] ?? '');
+            if ($reportedTrade === '' || (string) ($order['out_trade_no'] ?? '') !== (string) $attempt->out_trade_no
+                || (string) ($order['code'] ?? '1') !== '1'
+                || (!empty($attempt->provider_trade_no) && $reportedTrade !== (string) $attempt->provider_trade_no)) {
+                throw new RuntimeException('尚未确认旧支付订单属于当前商户，请联系管理员核对。');
+            }
+            if ($attempt->status === 'awaiting_callback' && empty($attempt->provider_trade_no) && $evidence['state'] === 'unpaid') {
+                Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->update(array('status' => 'pending', 'last_error' => null));
+                $attempt->status = 'pending';
+            }
+            epay_secure_bind_gateway($attempt, $fingerprint);
+        }
         if ($evidence['state'] === 'paid') {
             $order['type'] = $order['type'] ?? $attempt->payment_type;
-            $note = epay_secure_record_attempt_payment($attempt, $order);
+            $note = epay_secure_accept_attempt_receipt($attempt, $order, $gateway, false);
             logTransaction($gateway['name'], array('invoice_id' => $invoiceId, 'out_trade_no' => $attempt->out_trade_no), $note);
             throw new RuntimeException('支付平台已确认付款，请刷新发票查看状态。');
+        }
+        if (in_array($evidence['state'], array('refunded', 'payment_review'), true)) {
+            $tradeNo = (string) ($order['trade_no'] ?? '');
+            if ($tradeNo === '' || strlen($tradeNo) > 128
+                || (!empty($attempt->provider_trade_no) && $tradeNo !== (string) $attempt->provider_trade_no)) {
+                throw new RuntimeException('平台的退款记录与原交易号不符，请联系管理员核对。');
+            }
+            epay_secure_mark_attempt_review($attempt->id, $tradeNo, $order, '平台显示退款或历史付款，需核对实际到账。');
+            throw new RuntimeException('支付平台显示退款或历史付款，请联系管理员核账。');
         }
         if ($evidence['state'] === 'paid_notice' || $attempt->status === 'awaiting_callback') {
             $tradeNo = (string) ($order['trade_no'] ?? '');
@@ -376,26 +475,32 @@ function epay_secure_serve_callback($legacy)
         }
 
         $lock = epay_secure_invoice_lock($invoiceId);
-        $known = epay_secure_recorded_transaction($invoiceId, $data['trade_no']);
         if ($legacy) {
-            $known = $known || Capsule::table('mod_epay_legacy_events')->where('invoice_id', $invoiceId)
-                ->where('provider_trade_no', $data['trade_no'])->where('out_trade_no', $orderNo)->exists()
-                || epay_secure_get_meta(epay_secure_legacy_resolution_key($invoiceId, $data['trade_no']), '') !== '';
-            if (!$known) {
-                epay_secure_verify_provider_order($gateway, $orderNo, $data['trade_no'], $data['type'], $data['money']);
+            $original = (object) array('invoice_id' => $invoiceId, 'out_trade_no' => $orderNo);
+            $fingerprint = epay_secure_gateway_fingerprint($gateway);
+            $prior = Capsule::table('mod_epay_payment_reviews')->where('event_key', epay_secure_review_event_key($original, $data, $fingerprint))->first();
+            if ($prior) {
+                $note = $prior->status === 'reconciled' ? '已核账旧交易的重复通知' : '旧交易已收款待人工核账';
+            } else {
+                try {
+                    $known = epay_secure_recorded_transaction($invoiceId, $data['trade_no'])
+                        || Capsule::table('mod_epay_legacy_events')->where('invoice_id', $invoiceId)
+                            ->where('provider_trade_no', $data['trade_no'])->where('out_trade_no', $orderNo)->exists()
+                        || epay_secure_get_meta(epay_secure_legacy_resolution_key($invoiceId, $data['trade_no']), '') !== '';
+                    if (!$known) {
+                        epay_secure_verify_provider_order($gateway, $orderNo, $data['trade_no'], $data['type'], $data['money']);
+                    }
+                    $note = epay_secure_record_legacy_payment($invoiceId, $data);
+                } catch (EpaySecurePaymentReview $e) {
+                    $note = epay_secure_record_payment_review($original, $data, $fingerprint, $e->getMessage());
+                }
             }
-            $note = epay_secure_record_legacy_payment($invoiceId, $data);
         } else {
             $attempt = Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->first();
             if (!$attempt) {
                 throw new RuntimeException('支付订单在处理前已被移除。');
             }
-            $known = $known || ((string) $attempt->provider_trade_no === $data['trade_no']
-                && in_array($attempt->status, array('paid_review', 'reconciled'), true));
-            if (!$known) {
-                epay_secure_verify_provider_order($gateway, $orderNo, $data['trade_no'], $data['type'], $data['money']);
-            }
-            $note = epay_secure_record_attempt_payment($attempt, $data);
+            $note = epay_secure_accept_attempt_receipt($attempt, $data, $gateway, true);
         }
 
         logTransaction($gateway['name'], $data, $note);

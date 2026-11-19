@@ -81,7 +81,7 @@ function epay_config()
         'verifyOrderQuery' => array(
             'Type' => 'yesno',
             'FriendlyName' => '回调后二次查询订单',
-            'Description' => '收到签名成功回调后再向平台确认。支持 MHPay 或经典 V1 查单的支付商可启用。',
+            'Description' => '支持经典 V1 查单的支付商可启用。MHPay 自动入账始终使用 V2 查单确认。',
         ),
         'allowHttp' => array(
             'Type' => 'yesno',
@@ -150,7 +150,8 @@ function epay_link($params)
             $timestamp,
             $returnUrl,
             $description,
-            $key
+            $key,
+            epay_secure_gateway_fingerprint($params)
         );
 
         $action = rtrim((string) $params['systemurl'], '/') . '/modules/gateways/epay/pay.php';

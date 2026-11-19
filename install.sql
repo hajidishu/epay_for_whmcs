@@ -1,10 +1,11 @@
--- WHMCS EPay Secure 2.2 fresh-install schema
+-- WHMCS EPay Secure 2.4 fresh-install schema
 
 CREATE TABLE IF NOT EXISTS `mod_epay_attempts` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `invoice_id` INT UNSIGNED NOT NULL,
   `out_trade_no` VARCHAR(64) NOT NULL,
   `provider_trade_no` VARCHAR(128) NULL,
+  `gateway_fingerprint` VARCHAR(64) NULL,
   `invoice_amount` DECIMAL(18,2) NULL,
   `invoice_currency` VARCHAR(16) NULL,
   `processing_amount` DECIMAL(18,2) NULL,
@@ -12,7 +13,7 @@ CREATE TABLE IF NOT EXISTS `mod_epay_attempts` (
   `conversion_rate` DECIMAL(28,12) NULL,
   `invoice_fee` DECIMAL(18,2) NULL,
   `payment_type` VARCHAR(32) NOT NULL,
-  `source` VARCHAR(16) NOT NULL DEFAULT 'v22',
+  `source` VARCHAR(16) NOT NULL DEFAULT 'v24',
   `status` VARCHAR(32) NOT NULL DEFAULT 'pending',
   `launch_count` INT UNSIGNED NOT NULL DEFAULT 1,
   `client_ip` VARCHAR(45) NULL,
@@ -56,6 +57,24 @@ CREATE TABLE IF NOT EXISTS `mod_epay_legacy_events` (
   KEY `epay_legacy_invoice_idx` (`invoice_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS `mod_epay_payment_reviews` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `event_key` VARCHAR(64) NOT NULL,
+  `invoice_id` INT UNSIGNED NOT NULL,
+  `out_trade_no` VARCHAR(64) NOT NULL,
+  `provider_trade_no` VARCHAR(128) NOT NULL,
+  `gateway_fingerprint` VARCHAR(64) NOT NULL,
+  `processing_amount` DECIMAL(18,2) NOT NULL,
+  `status` VARCHAR(32) NOT NULL DEFAULT 'paid_review',
+  `note` VARCHAR(255) NOT NULL,
+  `callback_payload` TEXT NULL,
+  `created_at` DATETIME NOT NULL,
+  `updated_at` DATETIME NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `mod_epay_payment_reviews_event_key_unique` (`event_key`),
+  KEY `epay_payment_reviews_invoice_status_idx` (`invoice_id`,`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT INTO `mod_epay_meta` (`meta_key`, `meta_value`, `updated_at`)
-VALUES ('schema_version', '2.2', NOW())
+VALUES ('schema_version', '2.4', NOW())
 ON DUPLICATE KEY UPDATE `meta_value` = VALUES(`meta_value`), `updated_at` = VALUES(`updated_at`);

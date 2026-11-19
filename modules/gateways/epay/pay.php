@@ -135,6 +135,7 @@ try {
     if ($invoiceId <= 0 || epay_secure_money_to_cents($invoiceAmount) <= 0 || epay_secure_money_to_cents($processingAmount) <= 0) {
         throw new RuntimeException('支付请求参数不完整。');
     }
+    $gatewayFingerprint = epay_secure_gateway_fingerprint($gatewayParams);
 
     if (!epay_secure_verify_launch_token(
         $invoiceId,
@@ -147,7 +148,8 @@ try {
         $description,
         $gatewayParams['key'],
         3600,
-        $receivedToken
+        $receivedToken,
+        $gatewayFingerprint
     )) {
         throw new RuntimeException('支付链接已过期或校验失败，请刷新发票页面后重新点击支付。');
     }
@@ -170,7 +172,7 @@ try {
     }
 
     epay_secure_assert_legacy_clear($invoiceId, $gatewayParams);
-    epay_secure_recover_open_orders($invoiceId, $gatewayParams);
+    epay_secure_recover_open_orders($invoiceId, $gatewayParams, $gatewayFingerprint);
     epay_pay_assert_invoice($invoiceId, $invoiceAmount, $invoiceCurrency);
 
     $attempt = epay_secure_get_or_create_attempt(
@@ -182,7 +184,8 @@ try {
         $paymentType,
         $lifetimeHours,
         epay_secure_client_ip(),
-        $feeRate
+        $feeRate,
+        $gatewayFingerprint
     );
 
     $notifyUrl = $systemUrl . '/modules/gateways/callback/epay.php';
