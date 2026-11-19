@@ -57,13 +57,20 @@ function epay_config()
             'Type' => 'text',
             'FriendlyName' => 'MAPI 支付入口缓存时间（分钟）',
             'Default' => '5',
-            'Description' => '仅 mapi 模式。payurl/qrcode/urlscheme 超过此时间后会在同一 out_trade_no 下尝试刷新；平台不支持刷新时会安全报错而不会创建新订单号。',
+            'Description' => '仅 mapi 模式。缓存过期后继续使用同一支付单，MHPay 优先打开原收银台。',
         ),
         'orderLifetimeHours' => array(
             'Type' => 'text',
             'FriendlyName' => '支付订单有效期（小时）',
             'Default' => '360',
-            'Description' => '支付商为 15 天时填写 360。过期后插件才会生成新的 out_trade_no',
+            'Description' => '填写平台给出的有效期供核账参考。平台确认旧单关闭后才能换号。',
+        ),
+        'legacyOrderMode' => array(
+            'Type' => 'dropdown',
+            'FriendlyName' => '旧版订单',
+            'Options' => array('verify' => '升级或迁移，核对旧单', 'fresh' => '首次接入，没有历史支付单'),
+            'Default' => 'verify',
+            'Description' => '已有旧网关订单时请选择核对旧单。',
         ),
         'handlingFee' => array(
             'Type' => 'text',
@@ -74,7 +81,7 @@ function epay_config()
         'verifyOrderQuery' => array(
             'Type' => 'yesno',
             'FriendlyName' => '回调后二次查询订单',
-            'Description' => '可选增强：收到成功回调后再调用经典 V1 /api.php?act=order 核对订单。仅在你的 EPay 明确兼容该查询接口时开启。',
+            'Description' => '收到签名成功回调后再向平台确认。支持 MHPay 或经典 V1 查单的支付商可启用。',
         ),
         'allowHttp' => array(
             'Type' => 'yesno',
@@ -116,7 +123,7 @@ function epay_link($params)
         // must not present another Pay button. pay.php/get_or_create_attempt repeats the
         // same check server-side because an older signed form can remain valid for 1 hour.
         if (epay_secure_invoice_has_unresolved_review($invoiceId)) {
-            return '<div class="alert alert-warning">此发票存在已确认待人工核账的支付，或仍在隔离期内且可能被支付的旧订单。为防止重复扣款，暂时禁止再次付款，请联系管理员。</div>';
+            return '<div class="alert alert-warning">此发票有已确认且待核账的付款，请联系管理员。</div>';
         }
 
         // WHMCS may have converted $params['amount']/currency for gateway processing.

@@ -2,8 +2,8 @@
 /**
  * Minimal QR Code encoder for EPay payment URI rendering.
  *
- * Implements QR Code Model 2 byte mode, error correction level L, versions 1-10.
- * This code is purpose-built for short payment URLs/URI payloads and has no external
+ * Implements QR Code Model 2 byte mode, error correction level L, versions 1-40.
+ * This code is purpose-built for payment URLs/URI payloads and has no external
  * runtime dependency or network call.
  */
 
@@ -18,7 +18,7 @@ if (!function_exists('epay_qr_svg')) {
         $quiet = 4;
         $count = count($matrix);
         $view = $count + ($quiet * 2);
-        $pixelSize = max(160, min(512, (int) $pixelSize));
+        $pixelSize = min(512, max(160, (int) $pixelSize, $view * 3));
         $path = array();
 
         for ($y = 0; $y < $count; $y++) {
@@ -40,8 +40,8 @@ if (!function_exists('epay_qr_svg')) {
 if (!function_exists('epay_qr_choose_version')) {
     function epay_qr_choose_version($byteLength)
     {
-        $dataCodewords = array(1 => 19, 2 => 34, 3 => 55, 4 => 80, 5 => 108, 6 => 136, 7 => 156, 8 => 194, 9 => 232, 10 => 274);
-        foreach ($dataCodewords as $version => $capacityBytes) {
+        for ($version = 1; $version <= 40; $version++) {
+            $capacityBytes = epay_qr_block_spec($version)['data'];
             $countBits = $version <= 9 ? 8 : 16;
             $requiredBits = 4 + $countBits + ($byteLength * 8);
             if ($requiredBits <= ($capacityBytes * 8)) {
@@ -129,22 +129,28 @@ if (!function_exists('epay_qr_make_codewords')) {
 if (!function_exists('epay_qr_block_spec')) {
     function epay_qr_block_spec($version)
     {
-        $table = array(
-            1 => array('data' => 19,  'ec' => 7,  'blocks' => array(19)),
-            2 => array('data' => 34,  'ec' => 10, 'blocks' => array(34)),
-            3 => array('data' => 55,  'ec' => 15, 'blocks' => array(55)),
-            4 => array('data' => 80,  'ec' => 20, 'blocks' => array(80)),
-            5 => array('data' => 108, 'ec' => 26, 'blocks' => array(108)),
-            6 => array('data' => 136, 'ec' => 18, 'blocks' => array(68, 68)),
-            7 => array('data' => 156, 'ec' => 20, 'blocks' => array(78, 78)),
-            8 => array('data' => 194, 'ec' => 24, 'blocks' => array(97, 97)),
-            9 => array('data' => 232, 'ec' => 30, 'blocks' => array(116, 116)),
-            10 => array('data' => 274, 'ec' => 18, 'blocks' => array(68, 68, 69, 69)),
-        );
-        if (!isset($table[(int) $version])) {
+        if ($version < 1 || $version > 40) {
             throw new RuntimeException('Unsupported QR version.');
         }
-        return $table[(int) $version];
+        // ISO Model 2 Level L block parameters, cross-checked against Project Nayuki.
+        $ecc = array(0, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+            28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30);
+        $blockCount = array(0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+            8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25)[$version];
+
+        $usable = (16 * $version + 128) * $version + 64;
+        if ($version >= 2) {
+            $alignCount = intdiv($version, 7) + 2;
+            $usable -= (25 * $alignCount - 10) * $alignCount - 55;
+        }
+        if ($version >= 7) {
+            $usable -= 36;
+        }
+        $data = intdiv($usable, 8) - $blockCount * $ecc[$version];
+        $short = intdiv($data, $blockCount);
+        $longBlocks = $data % $blockCount;
+        $blocks = array_merge(array_fill(0, $blockCount - $longBlocks, $short), array_fill(0, $longBlocks, $short + 1));
+        return array('data' => $data, 'ec' => $ecc[$version], 'blocks' => $blocks);
     }
 }
 
@@ -332,19 +338,16 @@ if (!function_exists('epay_qr_place_alignment')) {
 if (!function_exists('epay_qr_alignment_positions')) {
     function epay_qr_alignment_positions($version)
     {
-        $table = array(
-            1 => array(),
-            2 => array(6, 18),
-            3 => array(6, 22),
-            4 => array(6, 26),
-            5 => array(6, 30),
-            6 => array(6, 34),
-            7 => array(6, 22, 38),
-            8 => array(6, 24, 42),
-            9 => array(6, 26, 46),
-            10 => array(6, 28, 50),
-        );
-        return $table[(int) $version];
+        if ($version === 1) {
+            return array();
+        }
+        $count = intdiv($version, 7) + 2;
+        $step = intdiv($version * 8 + $count * 3 + 5, $count * 4 - 4) * 2;
+        $positions = array(6);
+        for ($i = $count - 2; $i >= 0; $i--) {
+            $positions[] = 10 + 4 * $version - $i * $step;
+        }
+        return $positions;
     }
 }
 

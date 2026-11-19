@@ -271,6 +271,10 @@ if (!function_exists('epay_secure_schema_add_column')) {
 if (!function_exists('epay_secure_ensure_schema')) {
     function epay_secure_ensure_schema()
     {
+        static $ready = false;
+        if ($ready) {
+            return;
+        }
         $schema = Capsule::schema();
         $attemptsExisted = $schema->hasTable('mod_epay_attempts');
 
@@ -379,11 +383,7 @@ if (!function_exists('epay_secure_ensure_schema')) {
             $cutoverAt = date('Y-m-d H:i:s');
             epay_secure_set_meta_if_missing('legacy_cutover_at', $cutoverAt);
         }
-        $cutoverTimestamp = strtotime($cutoverAt);
-        if ($cutoverTimestamp === false) {
-            $cutoverTimestamp = time();
-        }
-        epay_secure_set_meta_if_missing('legacy_accept_until', date('Y-m-d H:i:s', $cutoverTimestamp + (17 * 86400)));
+        $ready = true;
     }
 }
 
@@ -415,23 +415,6 @@ if (!function_exists('epay_secure_get_meta')) {
         }
         $value = Capsule::table('mod_epay_meta')->where('meta_key', (string) $key)->value('meta_value');
         return $value === null ? $defaultValue : (string) $value;
-    }
-}
-
-if (!function_exists('epay_secure_legacy_accept_until')) {
-    function epay_secure_legacy_accept_until()
-    {
-        epay_secure_ensure_schema();
-        return epay_secure_get_meta('legacy_accept_until', '');
-    }
-}
-
-if (!function_exists('epay_secure_legacy_is_open')) {
-    function epay_secure_legacy_is_open()
-    {
-        $until = epay_secure_legacy_accept_until();
-        $timestamp = $until !== '' ? strtotime($until) : false;
-        return $timestamp !== false && time() <= $timestamp;
     }
 }
 
@@ -484,27 +467,9 @@ if (!function_exists('epay_secure_invoice_has_unresolved_review')) {
             return false;
         }
 
-        $now = date('Y-m-d H:i:s');
-        Capsule::table('mod_epay_attempts')
-            ->where('invoice_id', $invoiceId)
-            ->where('status', 'blocked_review')
-            ->where('expires_at', '<=', $now)
-            ->update(array(
-                'status' => 'expired',
-                'last_seen_at' => $now,
-            ));
-
         if (Capsule::table('mod_epay_attempts')
             ->where('invoice_id', $invoiceId)
             ->where('status', 'paid_review')
-            ->exists()) {
-            return true;
-        }
-
-        if (Capsule::table('mod_epay_attempts')
-            ->where('invoice_id', $invoiceId)
-            ->where('status', 'blocked_review')
-            ->where('expires_at', '>', $now)
             ->exists()) {
             return true;
         }
@@ -520,7 +485,7 @@ if (!function_exists('epay_secure_assert_invoice_not_under_review')) {
     function epay_secure_assert_invoice_not_under_review($invoiceId)
     {
         if (epay_secure_invoice_has_unresolved_review($invoiceId)) {
-            throw new RuntimeException('此发票存在已确认待人工核账的支付，或仍在隔离期内且可能被支付的旧订单。为防止重复扣款，暂时禁止再次付款，请联系管理员。');
+            throw new RuntimeException('此发票有已确认且待核账的付款，请联系管理员。');
         }
     }
 }
@@ -611,54 +576,22 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
             $now
         ) {
             $lockedInvoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->lockForUpdate()->first();
-            if (!$lockedInvoice) {
-                throw new RuntimeException('Invoice no longer exists.');
+            if (!$lockedInvoice || $lockedInvoice->status !== 'Unpaid') {
+                throw new RuntimeException('该发票已无法继续支付。');
             }
 
-            // Database-level duplicate-payment guard. A provider-confirmed payment that
-            // still needs manual accounting review must block every new Payment Attempt.
-            Capsule::table('mod_epay_attempts')
-                ->where('invoice_id', $invoiceId)
-                ->where('status', 'blocked_review')
-                ->where('expires_at', '<=', $now)
-                ->update(array(
-                    'status' => 'expired',
-                    'last_seen_at' => $now,
-                ));
-
-            if (Capsule::table('mod_epay_attempts')
-                ->where('invoice_id', $invoiceId)
-                ->where('status', 'paid_review')
-                ->exists()
-                || Capsule::table('mod_epay_attempts')
-                    ->where('invoice_id', $invoiceId)
-                    ->where('status', 'blocked_review')
-                    ->where('expires_at', '>', $now)
-                    ->exists()
-                || Capsule::table('mod_epay_legacy_events')
-                    ->where('invoice_id', $invoiceId)
-                    ->where('status', 'paid_review')
-                    ->exists()) {
-                throw new RuntimeException('此发票已有已确认待核账支付，或仍可能被支付的隔离订单。为防止重复扣款，禁止创建新的支付订单。');
+            epay_secure_assert_invoice_not_under_review($invoiceId);
+            // Pending, locally expired and quarantined attempts may all still be payable.
+            $open = epay_secure_open_attempts($invoiceId)->orderBy('id')->limit(2)->get();
+            if (count($open) > 1) {
+                throw new RuntimeException('此发票有多笔未确认关闭的支付订单，请联系管理员核账。');
             }
-
-            Capsule::table('mod_epay_attempts')
-                ->where('invoice_id', $invoiceId)
-                ->where('status', 'pending')
-                ->where('expires_at', '<=', $now)
-                ->update(array(
-                    'status' => 'expired',
-                    'last_seen_at' => $now,
-                ));
-
-            $active = Capsule::table('mod_epay_attempts')
-                ->where('invoice_id', $invoiceId)
-                ->where('status', 'pending')
-                ->where('expires_at', '>', $now)
-                ->orderBy('id', 'desc')
-                ->first();
+            $active = $open->first();
 
             if ($active) {
+                if ($active->status === 'awaiting_callback') {
+                    throw new RuntimeException('支付平台显示已付款，请等待支付通知或联系管理员核账。');
+                }
                 $activeInvoiceAmount = isset($active->invoice_amount) && $active->invoice_amount !== null ? $active->invoice_amount : null;
                 $activeInvoiceCurrency = isset($active->invoice_currency) ? strtoupper((string) $active->invoice_currency) : '';
                 $activeProcessingAmount = isset($active->processing_amount) && $active->processing_amount !== null
@@ -730,7 +663,7 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
             }
 
             $expiresAt = date('Y-m-d H:i:s', time() + ($hours * 3600));
-            $id = Capsule::table('mod_epay_attempts')->insertGetId(array(
+            $fields = array(
                 'invoice_id' => $invoiceId,
                 'out_trade_no' => $outTradeNo,
                 'provider_trade_no' => null,
@@ -741,7 +674,7 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
                 'conversion_rate' => $conversionRate,
                 'invoice_fee' => $invoiceFee,
                 'payment_type' => $paymentType,
-                'source' => 'v22',
+                'source' => 'v23',
                 'status' => 'pending',
                 'launch_count' => 1,
                 'client_ip' => $clientIp,
@@ -753,10 +686,26 @@ if (!function_exists('epay_secure_get_or_create_attempt')) {
                 'expires_at' => $expiresAt,
                 'last_seen_at' => $now,
                 'paid_at' => null,
-            ));
+            );
+            // Legacy schemas may still require these compatibility columns on inserts.
+            if (Capsule::schema()->hasColumn('mod_epay_attempts', 'amount')) {
+                $fields['amount'] = $processingAmount;
+            }
+            if (Capsule::schema()->hasColumn('mod_epay_attempts', 'currency')) {
+                $fields['currency'] = $processingCurrency;
+            }
+            $id = Capsule::table('mod_epay_attempts')->insertGetId($fields);
 
             return Capsule::table('mod_epay_attempts')->where('id', $id)->first();
         });
+    }
+}
+
+if (!function_exists('epay_secure_open_attempts')) {
+    function epay_secure_open_attempts($invoiceId)
+    {
+        return Capsule::table('mod_epay_attempts')->where('invoice_id', (int) $invoiceId)
+            ->whereIn('status', array('pending', 'expired', 'blocked_review', 'awaiting_callback'));
     }
 }
 
@@ -806,7 +755,7 @@ if (!function_exists('epay_secure_post_form')) {
                 'Accept: application/json',
                 'Content-Type: application/x-www-form-urlencoded',
             ),
-            CURLOPT_USERAGENT => 'WHMCS-EPay/2.2',
+            CURLOPT_USERAGENT => 'WHMCS-EPay/2.3',
         ));
 
         $body = curl_exec($ch);
@@ -852,7 +801,7 @@ if (!function_exists('epay_secure_query_order_v1')) {
             CURLOPT_SSL_VERIFYPEER => (bool) $verifyTls,
             CURLOPT_SSL_VERIFYHOST => $verifyTls ? 2 : 0,
             CURLOPT_HTTPHEADER => array('Accept: application/json'),
-            CURLOPT_USERAGENT => 'WHMCS-EPay/2.2',
+            CURLOPT_USERAGENT => 'WHMCS-EPay/2.3',
         ));
         $body = curl_exec($ch);
         $error = curl_error($ch);
@@ -881,6 +830,15 @@ if (!function_exists('epay_secure_verify_provider_order')) {
             return;
         }
 
+        if (epay_secure_is_mhpay($gatewayParams)) {
+            $evidence = epay_secure_query_mhpay_order($gatewayParams, $outTradeNo);
+            $reportedTrade = $evidence['order']['trade_no'] ?? null;
+            if ($evidence['state'] !== 'paid_notice' || ($reportedTrade !== null && $reportedTrade !== (string) $transactionId)) {
+                throw new RuntimeException('MHPay 查单尚未确认付款，请重试回调。');
+            }
+            return;
+        }
+
         $order = epay_secure_query_order_v1($gatewayParams, $outTradeNo);
         if ((int) (isset($order['code']) ? $order['code'] : 0) !== 1) {
             throw new RuntimeException('Provider order query did not return success.');
@@ -904,6 +862,77 @@ if (!function_exists('epay_secure_verify_provider_order')) {
             throw new RuntimeException('Provider order query PID mismatch.');
         }
     }
+}
+
+function epay_secure_is_mhpay(array $gateway)
+{
+    return strcasecmp((string) parse_url((string) ($gateway['gatewayUrl'] ?? ''), PHP_URL_HOST), 'pay.hhdgdh.top') === 0;
+}
+
+function epay_secure_mhpay_status(array $response)
+{
+    return (string) ($response['code'] ?? '') === '1' && ($response['data']['status'] ?? null) === 'success';
+}
+
+function epay_secure_mhpay_order_paid(array $gateway, $outTradeNo)
+{
+    $base = epay_secure_gateway_base_url($gateway['gatewayUrl'], false);
+    $body = epay_secure_post_form($base . '/api/EasyPay/queryOrder', array('orderNo' => (string) $outTradeNo), true);
+    $response = json_decode($body, true);
+    return is_array($response) && epay_secure_mhpay_status($response);
+}
+
+function epay_secure_mhpay_order_evidence(array $response, $outTradeNo)
+{
+    $data = $response['data'] ?? array();
+    if ((string) ($response['code'] ?? '') !== '1' || !is_array($data)) {
+        return array('state' => 'unknown', 'order' => array());
+    }
+    if ((string) ($data['out_order_no'] ?? '') !== (string) $outTradeNo || empty($data['order_no'])) {
+        return array('state' => 'mismatch', 'order' => array());
+    }
+    $order = array('out_trade_no' => (string) $outTradeNo, 'trade_no' => (string) $data['order_no']);
+    $status = strtolower((string) ($data['order_status'] ?? ''));
+    if ($status === 'paid' || (int) ($data['payment_time'] ?? 0) > 0 || (float) ($data['refund_amount'] ?? 0) > 0) {
+        return array('state' => 'paid_notice', 'order' => $order);
+    }
+    // MHPay documents a successful V2 lookup with bound order IDs. Only an
+    // explicit terminal status on that lookup can close a local Attempt.
+    if (in_array($status, array('closed', 'expired', 'cancelled', 'canceled'), true)) {
+        return array('state' => 'closed', 'order' => $order);
+    }
+    return array('state' => 'unknown', 'order' => $order);
+}
+
+function epay_secure_query_mhpay_order(array $gateway, $outTradeNo)
+{
+    $base = epay_secure_gateway_base_url($gateway['gatewayUrl'], false);
+    $params = array('merchantId' => (string) $gateway['pid'], 'orderNo' => (string) $outTradeNo);
+    $params['sign'] = epay_secure_sign($params, $gateway['key']);
+    try {
+        $body = epay_secure_post_form($base . '/api/v2/queryorder', $params, true);
+        $response = json_decode($body, true);
+        $evidence = epay_secure_mhpay_order_evidence(is_array($response) ? $response : array(), $outTradeNo);
+    } catch (RuntimeException $e) {
+        $evidence = array('state' => 'unknown', 'order' => array());
+    }
+    if ($evidence['state'] !== 'unknown' || $evidence['order']) {
+        return $evidence;
+    }
+    return array('state' => epay_secure_mhpay_order_paid($gateway, $outTradeNo) ? 'paid_notice' : 'unknown', 'order' => array());
+}
+
+function epay_secure_cashier_url(array $response, array $gateway)
+{
+    $url = trim((string) ($response['cashurl'] ?? ''));
+    $parts = parse_url($url);
+    $base = parse_url((string) ($gateway['gatewayUrl'] ?? ''));
+    if (!$parts || !$base || strtolower($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])
+        || isset($parts['user']) || isset($parts['pass']) || strcasecmp($parts['host'], $base['host'] ?? '') !== 0
+        || ($parts['port'] ?? 443) !== ($base['port'] ?? 443) || preg_match('/[\x00-\x20\x7f]/', $url)) {
+        return null;
+    }
+    return $url;
 }
 
 if (!function_exists('epay_secure_is_safe_web_url')) {

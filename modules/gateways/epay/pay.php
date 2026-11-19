@@ -5,7 +5,7 @@ require_once __DIR__ . '/../../../init.php';
 App::load_function('gateway');
 App::load_function('invoice');
 
-require_once __DIR__ . '/lib.php';
+require_once __DIR__ . '/recovery.php';
 require_once __DIR__ . '/qr.php';
 
 use WHMCS\Config\Setting;
@@ -29,8 +29,26 @@ function epay_pay_error($message, $invoiceId, $systemUrl, $httpCode)
     exit;
 }
 
-function epay_pay_render_mapi_result(array $response, $safeReturnUrl, $allowHttp)
+function epay_pay_assert_invoice($invoiceId, $amount, $currency)
 {
+    $invoice = epay_secure_get_invoice_snapshot($invoiceId);
+    if ($invoice['status'] !== 'Unpaid') {
+        throw new RuntimeException('该发票当前无法继续支付，请返回发票查看状态。');
+    }
+    $sessionUserId = isset($_SESSION['uid']) ? (int) $_SESSION['uid'] : 0;
+    if ($sessionUserId > 0 && $invoice['user_id'] !== $sessionUserId) {
+        throw new RuntimeException('当前登录账户无权支付此发票。');
+    }
+    $conflict = epay_secure_invoice_payment_conflict($invoice, $currency, $amount);
+    if ($conflict !== null) {
+        throw new RuntimeException($conflict . '请刷新发票页面。');
+    }
+    epay_secure_assert_invoice_not_under_review($invoiceId);
+}
+
+function epay_pay_render_mapi_result(array $response, $safeReturnUrl, array $gateway)
+{
+    $allowHttp = !empty($gateway['allowHttp']);
     foreach (array('payurl', 'url') as $field) {
         if (!empty($response[$field]) && epay_secure_is_safe_web_url($response[$field], $allowHttp)) {
             header('Location: ' . (string) $response[$field], true, 303);
@@ -38,9 +56,16 @@ function epay_pay_render_mapi_result(array $response, $safeReturnUrl, $allowHttp
         }
     }
 
-    $qrPayload = null;
+    $cashier = epay_secure_cashier_url($response, $gateway);
+    $qrSvg = null;
     if (!empty($response['qrcode'])) {
-        $qrPayload = epay_secure_qr_payload($response['qrcode']);
+        try {
+            $qrSvg = epay_qr_svg(epay_secure_qr_payload($response['qrcode']), 320);
+        } catch (RuntimeException $e) {
+            if ($cashier === null) {
+                throw $e;
+            }
+        }
     }
 
     $urlScheme = null;
@@ -48,24 +73,31 @@ function epay_pay_render_mapi_result(array $response, $safeReturnUrl, $allowHttp
         $urlScheme = (string) $response['urlscheme'];
     }
 
-    if ($qrPayload === null && $urlScheme === null) {
+    if ($qrSvg === null && $urlScheme === null && $cashier !== null) {
+        header('Location: ' . $cashier, true, 303);
+        exit;
+    }
+    if ($qrSvg === null && $urlScheme === null) {
         throw new RuntimeException('支付平台下单成功，但没有返回可用的 payurl、qrcode 或 urlscheme。建议切换为 submit.php 模式。');
     }
 
     header('Content-Type: text/html; charset=utf-8');
     header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
     echo '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        . '<title>继续支付</title><style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7f9;color:#111}.card{max-width:560px;margin:40px auto;padding:28px;background:#fff;border:1px solid #e4e7eb;border-radius:14px;text-align:center}.qr{display:inline-block;padding:14px;background:#fff;border:1px solid #ddd;border-radius:10px}.btn{display:inline-block;margin:16px 6px 0;padding:11px 18px;border-radius:8px;text-decoration:none;background:#111;color:#fff}.back{display:inline-block;margin-top:20px;color:#333}p{line-height:1.65}</style></head><body><div class="card">';
+        . '<title>继续支付</title><style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7f9;color:#111}.card{max-width:560px;margin:40px auto;padding:28px;background:#fff;border:1px solid #e4e7eb;border-radius:14px;text-align:center}.qr{display:inline-block;max-width:100%;box-sizing:border-box;padding:14px;background:#fff;border:1px solid #ddd;border-radius:10px}.qr svg{display:block;max-width:100%;height:auto}.btn{display:inline-block;margin:16px 6px 0;padding:11px 18px;border-radius:8px;text-decoration:none;background:#111;color:#fff}.back{display:inline-block;margin-top:20px;color:#333}p{line-height:1.65}</style></head><body><div class="card">';
 
-    if ($qrPayload !== null) {
+    if ($qrSvg !== null) {
         echo '<h2>请扫码完成支付</h2><p>此二维码由本插件在本机根据支付平台返回的 qrcode 内容生成，不调用第三方二维码服务。</p>'
-            . '<div class="qr">' . epay_qr_svg($qrPayload, 320) . '</div>';
+            . '<div class="qr">' . $qrSvg . '</div>';
     } else {
         echo '<h2>请在支付客户端中继续</h2>';
     }
 
     if ($urlScheme !== null) {
         echo '<p><a class="btn" rel="noreferrer" href="' . epay_secure_html($urlScheme) . '">打开支付客户端</a></p>';
+    }
+    if ($cashier !== null) {
+        echo '<p><a class="btn" rel="noreferrer" href="' . epay_secure_html($cashier) . '">前往收银台</a></p>';
     }
 
     echo '<p><a class="back" href="' . epay_secure_html($safeReturnUrl) . '">返回发票</a></p>'
@@ -88,7 +120,7 @@ if (empty($gatewayParams['type'])) {
 
 $systemUrl = rtrim((string) Setting::getValue('SystemURL'), '/');
 $invoiceId = isset($_POST['invoice_id']) ? (int) $_POST['invoice_id'] : 0;
-$mapiLockName = null;
+$invoiceLock = null;
 
 try {
     $invoiceAmount = epay_secure_normalize_money(isset($_POST['invoice_amount']) ? $_POST['invoice_amount'] : '');
@@ -120,28 +152,9 @@ try {
         throw new RuntimeException('支付链接已过期或校验失败，请刷新发票页面后重新点击支付。');
     }
 
-    $invoice = epay_secure_get_invoice_snapshot($invoiceId);
-    if ($invoice['status'] !== 'Unpaid') {
-        throw new RuntimeException('该发票当前状态不是 Unpaid，无需或无法继续支付。');
-    }
-    if ($invoice['paymentmethod'] !== '' && $invoice['paymentmethod'] !== $gatewayModuleName) {
-        throw new RuntimeException('该发票当前已选择其他支付方式，请刷新发票页面。');
-    }
-
-    $sessionUserId = isset($_SESSION['uid']) ? (int) $_SESSION['uid'] : 0;
-    if ($sessionUserId > 0 && $invoice['user_id'] !== $sessionUserId) {
-        throw new RuntimeException('当前登录账户无权支付此发票。');
-    }
-
-    // The invoice-side snapshot is authoritative for WHMCS accounting and must still be current.
-    if (epay_secure_money_to_cents($invoice['balance']) !== epay_secure_money_to_cents($invoiceAmount)
-        || $invoice['currency'] !== $invoiceCurrency) {
-        throw new RuntimeException('发票余额或原币种已经发生变化，请刷新发票页面后重新支付。');
-    }
-
-    // A signed form can remain valid for up to one hour, so never rely only on the
-    // hidden/disabled button in epay_link(). Re-check paid_review on every launch.
-    epay_secure_assert_invoice_not_under_review($invoiceId);
+    epay_secure_initialize_cutover($gatewayParams);
+    $invoiceLock = epay_secure_invoice_lock($invoiceId);
+    epay_pay_assert_invoice($invoiceId, $invoiceAmount, $invoiceCurrency);
 
     $baseUrl = epay_secure_gateway_base_url($gatewayParams['gatewayUrl'], !empty($gatewayParams['allowHttp']));
     $paymentType = epay_secure_payment_type($gatewayParams['payType']);
@@ -149,7 +162,16 @@ try {
     if ($lifetimeHours <= 0) {
         $lifetimeHours = 360;
     }
+    $lifetimeHours = min(720, $lifetimeHours);
     $feeRate = isset($gatewayParams['handlingFee']) ? (float) $gatewayParams['handlingFee'] : 0.0;
+    $requestMode = isset($gatewayParams['requestMode']) ? (string) $gatewayParams['requestMode'] : 'submit';
+    if (!in_array($requestMode, array('mapi', 'submit'), true)) {
+        throw new RuntimeException('未知的 EPay 下单方式，请在网关设置中选择 submit 或 mapi。');
+    }
+
+    epay_secure_assert_legacy_clear($invoiceId, $gatewayParams);
+    epay_secure_recover_open_orders($invoiceId, $gatewayParams);
+    epay_pay_assert_invoice($invoiceId, $invoiceAmount, $invoiceCurrency);
 
     $attempt = epay_secure_get_or_create_attempt(
         $invoiceId,
@@ -163,14 +185,8 @@ try {
         $feeRate
     );
 
-    // Narrow the race between Attempt creation/reuse and a concurrent legacy/new
-    // callback entering paid_review. This protects submit mode too, before the browser
-    // receives a form that could create another provider-side payment flow.
-    epay_secure_assert_invoice_not_under_review($invoiceId);
-
     $notifyUrl = $systemUrl . '/modules/gateways/callback/epay.php';
     $safeReturnUrl = epay_secure_validate_return_url($returnUrl, $systemUrl, $invoiceId);
-    $requestMode = isset($gatewayParams['requestMode']) ? (string) $gatewayParams['requestMode'] : 'submit';
 
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
     header('Pragma: no-cache');
@@ -183,19 +199,6 @@ try {
             : 5;
         $artifactTtlMinutes = max(1, min(1440, $artifactTtlMinutes));
 
-        // Serialize the whole remote-order/artifact refresh section for this out_trade_no.
-        // After acquiring the advisory lock, re-read the Attempt because another request
-        // may already have created/refreshed the provider order while we were waiting.
-        $mapiLockName = epay_secure_acquire_lock('mapi-create:' . (string) $attempt->out_trade_no, 25);
-        $attempt = Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->first();
-        if (!$attempt) {
-            throw new RuntimeException('Payment Attempt no longer exists.');
-        }
-
-        // A paid_review may have arrived from an older payment while this browser request
-        // was waiting for the MAPI lock. Check again immediately before any remote call.
-        epay_secure_assert_invoice_not_under_review($invoiceId);
-
         $storedResponse = null;
         $hadSuccessfulStoredResponse = false;
         if (!empty($attempt->provider_response)) {
@@ -204,13 +207,21 @@ try {
                 && (int) (isset($storedResponse['code']) ? $storedResponse['code'] : 0) === 1;
         }
 
-        // Cache only the payment artifact (payurl/qrcode/urlscheme) for its own short TTL.
-        // The provider order itself may live for 15 days, but its entry token may not.
+        if ($hadSuccessfulStoredResponse && epay_secure_is_mhpay($gatewayParams)) {
+            $cashier = epay_secure_cashier_url($storedResponse, $gatewayParams);
+            if ($cashier !== null) {
+                epay_secure_release_lock($invoiceLock);
+                $invoiceLock = null;
+                header('Location: ' . $cashier, true, 303);
+                exit;
+            }
+        }
+        // The entry token and the provider order have independent lifetimes.
         if ($hadSuccessfulStoredResponse
             && epay_secure_provider_artifact_is_fresh($attempt, $artifactTtlMinutes)) {
-            epay_secure_release_lock($mapiLockName);
-            $mapiLockName = null;
-            epay_pay_render_mapi_result($storedResponse, $safeReturnUrl, !empty($gatewayParams['allowHttp']));
+            epay_secure_release_lock($invoiceLock);
+            $invoiceLock = null;
+            epay_pay_render_mapi_result($storedResponse, $safeReturnUrl, $gatewayParams);
         }
 
         $orderParams = epay_secure_build_order_params(
@@ -252,8 +263,7 @@ try {
 
             if ($hadSuccessfulStoredResponse) {
                 throw new RuntimeException(
-                    '原支付入口已超过缓存有效期，但支付平台不支持在同一订单号下刷新入口。'
-                    . '为避免展示失效二维码或重复创建订单，请联系管理员，建议改用 submit.php 模式。'
+                    '暂未取得原订单的新支付入口。请稍后重试或联系管理员核对原订单。'
                 );
             }
 
@@ -279,14 +289,10 @@ try {
             $attemptUpdate['expires_at'] = date('Y-m-d H:i:s', time() + ($lifetimeHours * 3600));
         }
         Capsule::table('mod_epay_attempts')->where('id', $attempt->id)->update($attemptUpdate);
-
-        epay_secure_release_lock($mapiLockName);
-        $mapiLockName = null;
-        epay_pay_render_mapi_result($response, $safeReturnUrl, !empty($gatewayParams['allowHttp']));
-    }
-
-    if ($requestMode !== 'submit') {
-        throw new RuntimeException('未知的 EPay 下单方式，请在网关设置中选择 submit 或 mapi。');
+        epay_pay_assert_invoice($invoiceId, $invoiceAmount, $invoiceCurrency);
+        epay_secure_release_lock($invoiceLock);
+        $invoiceLock = null;
+        epay_pay_render_mapi_result($response, $safeReturnUrl, $gatewayParams);
     }
 
     $orderParams = epay_secure_build_order_params(
@@ -298,6 +304,9 @@ try {
         false
     );
     $submitUrl = $baseUrl . '/submit.php';
+    epay_pay_assert_invoice($invoiceId, $invoiceAmount, $invoiceCurrency);
+    epay_secure_release_lock($invoiceLock);
+    $invoiceLock = null;
 
     header('Content-Type: text/html; charset=utf-8');
     echo '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -312,7 +321,7 @@ try {
         . '</body></html>';
     exit;
 } catch (Throwable $e) {
-    epay_secure_release_lock($mapiLockName);
+    epay_secure_release_lock($invoiceLock);
     try {
         if ($invoiceId > 0) {
             logTransaction('EPay Secure', array('invoice_id' => $invoiceId), '发起支付失败: ' . $e->getMessage());

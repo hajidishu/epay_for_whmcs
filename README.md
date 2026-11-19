@@ -4,7 +4,7 @@ EPay for WHMCS 是一款适用于 WHMCS 的 EPay兼容支付网关插件。
 
 本插件用于在 WHMCS 中接入兼容 EPay API 的支付服务商，支持多种订单方式，并解决了部分epay兼容系统订单过期问题
 
-当前版本：**v2.2**
+当前版本：**v2.3**
 
 > 本项目为第三方开源插件，与 WHMCS、EPay 或任何支付服务商均无官方关联。
 
@@ -110,8 +110,9 @@ EPay Secure
 | 支付网关地址 | 例如 `https://pay.example.com`，不需要带submit.php之类的 |
 | 支付方式 | 例如 `alipay` 或 `wxpay`（具体字段请联系你的支付提供商，某些支付可能是 zfb wxzf 之类的字段） |
 | 下单方式 | 如果你不知道这是什么，那就选择 `submit.php` |
-| 支付订单有效期 | 联系你的支付提供商 |
+| 支付订单有效期 | 填写支付商公布的有效期，供核账参考 |
 | MAPI 支付入口缓存时间 | 默认 `5` 分钟 |
+| 旧版订单 | 有旧订单就选核对旧单。全新接入且没有历史支付单时选首次接入 |
 | 手续费率 | 仅为whmcs后台收入计算使用，和用户支付金额无关 |
 | 回调后二次查询订单 | 你不知道这是干什么的就别开 |
 | 允许 HTTP | 建议关闭 |
@@ -137,13 +138,21 @@ https://pay.example.com/mapi.php
 
 保存设置即可。
 
+### MHPay
+
+网关地址填写 `https://pay.hhdgdh.top`。MAPI 模式重新发起付款时，可以打开同一笔订单的 MHPay 收银台。插件使用商户签名查单，必要时使用 V1 状态查询。查到已付款时会等待有效回调或人工核账。
+
+平台明确确认旧单关闭后，客户可以在原发票上取得新的支付订单。仅本地有效期到了、平台请求失败或状态不明时，客户继续使用原支付单或联系管理员核对。MHPay 公开文档未提供关单接口，可在商户后台核对，或请平台客服确认后使用下方的核账命令。
+
+[MHPay 开发文档](https://pay.hhdgdh.top/doc)
+
 ---
 
 # 从旧版插件升级
 
 如果你之前已经使用旧版此插件或其他epay插件，请不要先在 WHMCS 后台删除支付网关。
 
-v2.2 仍然使用相同的支付网关模块名称，可以直接原位升级。
+v2.3 仍然使用相同的支付网关模块名称。v2.2 原位升级可沿用现有表结构。
 
 ## 1. 备份
 
@@ -151,7 +160,7 @@ v2.2 仍然使用相同的支付网关模块名称，可以直接原位升级。
 
 ## 2. 覆盖文件
 
-将 v2.2 发布包中的：
+将 v2.3 发布包中的：
 
 ```text
 modules/
@@ -178,6 +187,8 @@ modules/
 然后重新保存一次设置。
 
 # 安装后的测试
+
+本地模拟回归运行 `php tests/acceptance.php`，不连接支付平台。
 
 正式开放给客户使用前，建议完成以下测试。
 
@@ -209,7 +220,7 @@ modules/
 
 从其他 EPay 插件升级后，升级前已经创建的旧支付订单可能仍然存在一段时间。
 
-v2.2 会为这些旧订单保留一个临时兼容回调。
+升级后仍保留旧订单的兼容回调。客户重新付款前会先核对旧单。平台无法确认旧单状态时，由管理员核账后开通新的支付入口。
 
 如果旧订单在升级后才完成付款，插件可能会将该付款标记为：
 
@@ -239,9 +250,21 @@ paid_review
 2. 确认该笔交易确实已经到账。
 3. 核对订单号、交易号和实际付款金额。
 4. 在 WHMCS 后台为对应发票正确记录付款。
-5. 确认账务无误后，再手动确认账单。
+5. 确认入账或退款后，用核账命令记录结果。账单有剩余金额时，客户可以继续付款。
 
 `paid_review` 的目的，是防止支付平台已经收到第一笔款项，但 WHMCS 尚未完成入账时客户再次支付。
+
+在 WHMCS 根目录用能读取 WHMCS 配置的 CLI PHP 运行下列命令。`123` 是发票 ID。
+
+```sh
+php modules/gateways/epay/reconcile.php status 123
+php modules/gateways/epay/reconcile.php confirm-closed 123 legacy "平台关单记录编号"
+php modules/gateways/epay/reconcile.php confirm-closed 123 WH-merchant-order "平台关单记录编号"
+php modules/gateways/epay/reconcile.php resolve-review 123 provider-trade-no recorded "WHMCS 入账记录编号"
+php modules/gateways/epay/reconcile.php resolve-review 123 provider-trade-no refunded "平台退款记录编号"
+```
+
+`confirm-closed` 要在平台确认订单已无法付款后运行。`recorded` 会检查交易已经记入对应的 WHMCS 发票。`refunded` 用于记录管理员已在平台核实的退款。查单只报已付款且未返回交易号时，可以在 `resolve-review` 命令末尾加上商户单号，旧版数字单号用 `legacy`。
 
 ---
 
@@ -253,7 +276,7 @@ paid_review
 
 不建议。
 
-v2.2 是旧版 EPay 插件的升级版本，应直接覆盖升级，而不是作为第二个独立 EPay 网关同时运行。
+v2.3 沿用旧版 EPay 网关名称，部署时覆盖现有模块文件。
 
 ## `tests` 文件夹需要上传吗？
 
